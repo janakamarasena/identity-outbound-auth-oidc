@@ -43,8 +43,11 @@ import org.wso2.carbon.identity.application.authentication.framework.context.Aut
 import org.wso2.carbon.identity.application.authentication.framework.exception.AuthenticationFailedException;
 import org.wso2.carbon.identity.application.authentication.framework.exception.LogoutFailedException;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
+import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatorData;
+import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatorParamMetadata;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkConstants;
 import org.wso2.carbon.identity.application.authentication.framework.util.FrameworkUtils;
+import org.wso2.carbon.identity.application.authentication.framework.util.auth.service.AuthServiceConstants;
 import org.wso2.carbon.identity.application.authenticator.oidc.internal.OpenIDConnectAuthenticatorDataHolder;
 import org.wso2.carbon.identity.application.authenticator.oidc.model.OIDCStateInfo;
 import org.wso2.carbon.identity.application.authenticator.oidc.util.OIDCErrorConstants.ErrorMessages;
@@ -82,6 +85,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -179,8 +183,19 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
                     .resultMessage("Outbound OIDC authenticator handling the authentication.");
             LoggerUtils.triggerDiagnosticLogEvent(diagnosticLogBuilder);
         }
+
+        //check request params for "authenticator" equals "OpenIDConnectAuthenticator" and request params contains "token" and "idToken"
+        if (isAPIBasedAuthCall(request)) {
+            return  true;
+        }
+
         return canHandle;
         // TODO : What if IdP failed?
+    }
+
+    private boolean isAPIBasedAuthCall(HttpServletRequest request) {
+
+        return request.getParameter("accessToken") != null && request.getParameter("idToken") != null;
     }
 
     /**
@@ -194,7 +209,8 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
      */
     protected boolean isInitialRequest(AuthenticationContext context, HttpServletRequest request) {
 
-        return !context.isLogoutRequest() && !hasCodeParamInRequest(request) && !hasErrorParamInRequest(request);
+        return !context.isLogoutRequest() && !hasCodeParamInRequest(request) && !hasErrorParamInRequest(request)
+                && !isAPIBasedAuthCall(request);
     }
 
     private boolean hasErrorParamInRequest(HttpServletRequest request) {
@@ -405,6 +421,7 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
                 LoggerUtils.triggerDiagnosticLogEvent(diagnosticLogBuilder);
             }
             Map<String, String> authenticatorProperties = context.getAuthenticatorProperties();
+            setRequiredAuthParams(request);
             if (authenticatorProperties != null) {
                 DiagnosticLog.DiagnosticLogBuilder diagnosticLogBuilder = null;
                 if (LoggerUtils.isDiagnosticLogsEnabled()) {
@@ -493,6 +510,7 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
                         loginPage = loginPage + queryString;
                     }
                 }
+                context.setProperty(OIDCAuthenticatorConstants.AUTHENTICATOR_NAME + "_additional_data", loginPage);
                 response.sendRedirect(loginPage);
                 if (LoggerUtils.isDiagnosticLogsEnabled() && diagnosticLogBuilder != null) {
                     diagnosticLogBuilder.resultMessage("Redirecting to the federated IDP login page.");
@@ -696,9 +714,16 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
      *                                       response or the parameters.
      */
     protected OAuthClientResponse requestAccessToken(HttpServletRequest request, AuthenticationContext context)
-            throws AuthenticationFailedException {
+            throws AuthenticationFailedException {//request.getParameterMap()
 
         OAuthClientResponse oAuthResponse;
+        if (isAPIBasedAuthCall(request)) {
+            CustomOAuthClientResponse customOAuthClientResponse = new CustomOAuthClientResponse();
+            customOAuthClientResponse.setAccessToken(request.getParameter("accessToken"));
+            customOAuthClientResponse.setIdToken(request.getParameter("idToken"));
+
+            return customOAuthClientResponse;
+        }
         try {
             OAuthAuthzResponse authzResponse = OAuthAuthzResponse.oauthCodeAuthzResponse(request);
             OAuthClientRequest accessTokenRequest = getAccessTokenRequest(context, authzResponse);
@@ -975,6 +1000,10 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
         if (LOG.isDebugEnabled()) {
             LOG.debug("Inside OpenIDConnectAuthenticator.getContextIdentifier()");
         }
+        if (isAPIBasedAuthCall(request)) {
+            return request.getParameter("sessionDataKey");
+        }
+
         String state = request.getParameter(OIDCAuthenticatorConstants.OAUTH2_PARAM_STATE);
         if (state != null) {
             return state.split(",")[0];
@@ -1416,5 +1445,91 @@ public class OpenIDConnectAuthenticator extends AbstractApplicationAuthenticator
                     return localClaim + " : " + remoteClaim;
                 })
                 .collect(Collectors.toList());
+    }
+
+    private void setRequiredAuthParams(HttpServletRequest request) {
+
+        Map<String, String> requiredAuthParams = new HashMap<>();
+        requiredAuthParams.put(OIDCAuthenticatorConstants.OAUTH2_PARAM_STATE, "STRING");
+        requiredAuthParams.put(OIDCAuthenticatorConstants.OAUTH2_GRANT_TYPE_CODE, "STRING");
+        request.setAttribute("requiredAuthenticationParams", requiredAuthParams);
+    }
+
+    @Override
+    public boolean isAPIBasedAuthenticationSupported() {
+
+        return true;
+    }
+
+    @Override
+    public Optional<AuthenticatorData> getAuthInitiationData(AuthenticationContext context) {
+
+        AuthenticatorData authenticatorData = new AuthenticatorData();
+        authenticatorData.setName(getName());
+        authenticatorData.setDisplayName(getFriendlyName());
+        String idpName = context.getExternalIdP().getIdPName();
+        authenticatorData.setIdp(idpName);
+
+        List<AuthenticatorParamMetadata> authenticatorParamMetadataList = new ArrayList<>();
+        AuthenticatorParamMetadata stateMetadata = new AuthenticatorParamMetadata(
+                OIDCAuthenticatorConstants.OAUTH2_PARAM_STATE,
+                FrameworkConstants.AuthenticatorParamType.STRING, 0);
+        stateMetadata.setParamGroup(1);
+        authenticatorParamMetadataList.add(stateMetadata);
+
+        AuthenticatorParamMetadata codeMetadata = new AuthenticatorParamMetadata(
+                OIDCAuthenticatorConstants.OAUTH2_GRANT_TYPE_CODE,
+                FrameworkConstants.AuthenticatorParamType.STRING, 1);
+        codeMetadata.setParamGroup(1);
+        authenticatorParamMetadataList.add(codeMetadata);
+
+        AuthenticatorParamMetadata accessTokenMetadata = new AuthenticatorParamMetadata(
+                "accessToken", FrameworkConstants.AuthenticatorParamType.STRING, 0);
+        accessTokenMetadata.setParamGroup(2);
+        authenticatorParamMetadataList.add(accessTokenMetadata);
+
+        AuthenticatorParamMetadata idTokenMetadata = new AuthenticatorParamMetadata(
+                "idToken", FrameworkConstants.AuthenticatorParamType.STRING, 1);
+        idTokenMetadata.setParamGroup(2);
+        authenticatorParamMetadataList.add(idTokenMetadata);
+
+        authenticatorData.setAuthParams(authenticatorParamMetadataList);
+
+        Map<String, String> additionalData = new HashMap<>();
+        additionalData.put("call",
+                (String) context.getProperty(OIDCAuthenticatorConstants.AUTHENTICATOR_NAME + "_additional_data"));
+
+        authenticatorData.setAdditionalData(additionalData);
+
+        return Optional.of(authenticatorData);
+    }
+
+    //create a new class extending org.apache.oltu.oauth2.client.response.OAuthClientResponse have a method to set parameters
+    public class CustomOAuthClientResponse extends OAuthClientResponse {
+
+        public void setAccessToken(String accessToken) {
+
+            this.parameters.put(OIDCAuthenticatorConstants.ACCESS_TOKEN, accessToken);
+        }
+
+        public void setIdToken(String idToken) {
+
+            this.parameters.put(OIDCAuthenticatorConstants.ID_TOKEN, idToken);
+        }
+
+        @Override
+        protected void setBody(String s) throws OAuthProblemException {
+
+        }
+
+        @Override
+        protected void setContentType(String s) {
+
+        }
+
+        @Override
+        protected void setResponseCode(int i) {
+
+        }
     }
 }
